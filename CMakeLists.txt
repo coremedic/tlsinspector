@@ -9,4 +9,5 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_definitions(-DDEBUG)
 endif()
 
-add_executable(tlsinspector src/main.cpp)
+add_executable(tlsinspector src/main.cpp
+        include/structs.hpp)

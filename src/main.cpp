@@ -1,143 +1,111 @@
 #include <windows.h>
 #include <winternl.h>
 #include <tlhelp32.h>
-#include <vector>
 #include <cstdio>
 
-HANDLE* EnumThreads(IN DWORD pid, OUT int* threadCount) {
-    std::vector<HANDLE> tmpHandles;
-    BOOL   bResult         = FALSE;
-    HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
-    if (hThreadSnapshot == INVALID_HANDLE_VALUE) {
-#ifdef DEBUG
-        printf("[!] CreateToolhelp32Snapshot returned an invalid handle for thread\n");
-#endif
+#include "structs.hpp"
 
+PVOID GetPebAddress(HANDLE ProcessHandle) {
+    HMODULE hNtdll = LoadLibrary(TEXT("ntdll.dll"));
+    if (hNtdll == NULL) {
+        printf("Failed to load ntdll.dll\n");
         return NULL;
     }
 
-    THREADENTRY32 te32 = {0};
-    te32.dwSize = sizeof(THREADENTRY32);
-
-    bResult = Thread32First(hThreadSnapshot, &te32);
-    if (!bResult) {
-#ifdef DEBUG
-        printf("[!] Thread32First returned false\n");
-#endif
-
-        CloseHandle(hThreadSnapshot);
+    pfnNtQueryInformationProcess NtQueryInformationProcess = (pfnNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+    if (NtQueryInformationProcess == NULL) {
+        printf("Failed to get address of NtQueryInformationProcess\n");
+        FreeLibrary(hNtdll);
         return NULL;
     }
 
-    while (bResult) {
-        if (te32.th32OwnerProcessID == pid) {
-            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
-            if (hThread) {
-#ifdef DEBUG
-                printf("[i] Inspecting thread [%lu] of process [%lu]\n", te32.th32ThreadID, te32.th32OwnerProcessID);
-#endif
-
-                tmpHandles.push_back(hThread);
-            }
-        }
-        bResult = Thread32Next(hThreadSnapshot, &te32);
+    PROCESS_BASIC_INFORMATION pbi;
+    NTSTATUS status = NtQueryInformationProcess(ProcessHandle, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
+    if (status != 0) {
+        printf("NtQueryInformationProcess failed\n");
+        FreeLibrary(hNtdll);
+        return NULL;
     }
-    CloseHandle(hThreadSnapshot);
 
-    HANDLE* phThreads = new HANDLE[tmpHandles.size()];
-    *threadCount = static_cast<int>(tmpHandles.size());
-
-    for (size_t i = 0; i < tmpHandles.size(); ++i) {
-        phThreads[i] = tmpHandles[i];
-    }
-    return phThreads;
+    FreeLibrary(hNtdll);
+    return pbi.PebBaseAddress;
 }
 
-BOOL CheckTLSCallbackArray(IN HANDLE hProc, IN HANDLE hThread) {
-    if (!hProc || !hThread) {
+BOOL CheckTLSCallbackArray(IN HANDLE hProc, IN char procName[260]) {
+    if (!hProc) {
 #ifdef DEBUG
         printf("[!] Process or Thread handle is NULL\n");
 #endif
-
         return FALSE;
     }
 
-    ULONG_PTR               uImageBase          = NULL,
-                            uImageBaseBuffer    = NULL;
-    PIMAGE_NT_HEADERS       pImgNtHdrs          = NULL;
-    PIMAGE_DATA_DIRECTORY   pEntryTLSDataDir    = NULL;
-    PIMAGE_TLS_CALLBACK     pImgTlsCallback     = NULL;
-    CONTEXT                 ThreadContext       = {.ContextFlags = CONTEXT_ALL};
-    BOOL                    bResult             = FALSE;
-
-    if (!GetThreadContext(hThread, &ThreadContext)) {
+    PVOID pebAddress = GetPebAddress(hProc);
+    if (pebAddress == NULL) {
 #ifdef DEBUG
-        printf("[!] GetThreadContext failed with error [%lu]\n", GetLastError());
+        printf("[!] Failed to get PEB address\n");
 #endif
-
         return FALSE;
     }
 
-    size_t reserved3Offset = offsetof(PEB, Reserved3);
-    size_t elementSize = sizeof(PEB::Reserved3[0]);
-    size_t specificElementOffset = reserved3Offset + elementSize;
-    PVOID specificElementAddress = (char*)(ThreadContext.Rdx) + specificElementOffset;
-#ifdef DEBUG
-    printf("[i] PPEB Address: 0x%p \n", (void*)ThreadContext.Rdx);
-    printf("[i] Calculated Image Base Address To Be At: 0x%p \n", specificElementAddress);
-#endif
+    ULONG_PTR uImageBase = NULL;
+    PVOID uImageBaseBuffer = NULL;
+    PIMAGE_NT_HEADERS pImgNtHdrs = NULL;
+    PIMAGE_DATA_DIRECTORY pEntryTLSDataDir = NULL;
+    BOOL bResult = FALSE;
 
-    if (!ReadProcessMemory(hProc, specificElementAddress, &uImageBase, sizeof(PVOID), NULL)) {
+    if (!ReadProcessMemory(hProc, (PBYTE)pebAddress + 0x10, &uImageBase, sizeof(PVOID), NULL)) {
 #ifdef DEBUG
-        printf("[!] ReadProcessMemory failed with error: [%lu]\n", GetLastError());
+        printf("[!] ReadProcessMemory failed to read the image base from PEB with error [%lu]\n", GetLastError());
 #endif
-
         return FALSE;
     }
 
-    printf("[i] Image Base Address: 0x%p \n", (void*)uImageBase);
+#ifdef DEBUG
+    printf("[i] Image base address: 0x%p \n", (void*)uImageBase);
+#endif
 
-    if (!(uImageBaseBuffer = reinterpret_cast<ULONG_PTR>(LocalAlloc(LPTR, 0x1000)))) {
+    uImageBaseBuffer = LocalAlloc(LPTR, 0x1000);
+    if (!uImageBaseBuffer) {
 #ifdef DEBUG
         printf("[i] LocalAlloc failed with error: [%lu] \n", GetLastError());
 #endif
-
         return FALSE;
     }
 
-    if (!ReadProcessMemory(hProc, (PVOID)uImageBase, (LPVOID)uImageBaseBuffer, 0x1000, NULL)) {
+    if (!ReadProcessMemory(hProc, (PVOID)uImageBase, uImageBaseBuffer, 0x1000, NULL)) {
 #ifdef DEBUG
         printf("[!] ReadProcessMemory failed with error: [%lu]\n", GetLastError());
 #endif
-
         goto _CLEAN_UP;
     }
 
-    pImgNtHdrs = (PIMAGE_NT_HEADERS)(uImageBaseBuffer + ((PIMAGE_DOS_HEADER)uImageBaseBuffer)->e_lfanew);
+    pImgNtHdrs = (PIMAGE_NT_HEADERS)((ULONG_PTR)uImageBaseBuffer + ((PIMAGE_DOS_HEADER)uImageBaseBuffer)->e_lfanew);
     if (pImgNtHdrs->Signature != IMAGE_NT_SIGNATURE) {
+#ifdef DEBUG
+        printf("[!] NT Headers signature mismatch\n");
+#endif
+
         goto _CLEAN_UP;
     }
 
     pEntryTLSDataDir = &pImgNtHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if (!pEntryTLSDataDir->Size) {
-#ifdef DEBUG
-        printf("[!] Remote Process Does Not Have Any TLS Callback Function\n");
-#endif
-
         goto _CLEAN_UP;
     }
 
     bResult = TRUE;
-    printf("[i] Process seems to have a TLS callback function\n");
 
-    _CLEAN_UP:
-    LocalFree(reinterpret_cast<PVOID>(uImageBaseBuffer));
+_CLEAN_UP:
+    if (uImageBaseBuffer) {
+        LocalFree(uImageBaseBuffer);
+    }
     return bResult;
 }
 
+
 int main() {
-    HANDLE                      hProcSnapshot   = NULL;
-    HANDLE*                     phThreads       = NULL;
+    HANDLE                      hProcSnapshot   = NULL,
+                                hProc           = NULL;
     BOOL                        bResult         = FALSE;
     PROCESSENTRY32              pe32            = PROCESSENTRY32{};
 
@@ -162,35 +130,31 @@ int main() {
 
     while (bResult) {
 #ifdef DEBUG
-        printf("[i] Inspecting process [%lu]\n", pe32.th32ProcessID);
+        printf("[i] Inspecting process [%s]\n", pe32.szExeFile);
 #endif
 
-        if (hProcSnapshot) {
-            int threadCount = 0;
-            phThreads = EnumThreads(pe32.th32ProcessID, &threadCount);
-            if (phThreads != NULL) {
-                for (size_t i = 0; i < threadCount; ++i) {
-                    BOOL b = FALSE;
-                    b = CheckTLSCallbackArray(hProcSnapshot, phThreads[i]);
-                    if (b) {
-                        printf("[i] Process [%lu] seems to have a TLS callback function\n");
-                    }
+        while (bResult) {
+            hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe32.th32ProcessID);
+            if (hProc) {
+                BOOL b = FALSE;
+                b = CheckTLSCallbackArray(hProc, pe32.szExeFile);
+                if (b) {
+                    printf("[i] Remote Process [%s] seems to have a TLS callback function\n", pe32.szExeFile);
+                } else {
+                    printf("[i] Remote Process [%s] does not have a TLS callback function\n", pe32.szExeFile);
                 }
+                CloseHandle(hProc);
             }
-        } else {
-#ifdef DEBUG
-            printf("[i] No more processes to inspect\n");
-#endif
-
-            goto _CLEAN_UP;
+            bResult = Process32Next(hProcSnapshot, &pe32);
         }
-        delete[] phThreads;
-        bResult = Process32Next(hProcSnapshot, &pe32);
     }
 
     _CLEAN_UP:
     if (hProcSnapshot) {
         CloseHandle(hProcSnapshot);
+    }
+    if (hProc) {
+        CloseHandle(hProc);
     }
 
     return 0;
